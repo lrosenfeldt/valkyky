@@ -164,6 +164,7 @@ void stringPutN(string_t *str, const char *buffer, size_t len) {
 	return;
 }
 
+
 int stringCmp(string_t left, string_t right) {
 	if (left.len != right.len) {
 		int cmp;
@@ -278,7 +279,7 @@ int kvStoreGrow(kv_store_t *store, size_t new_nbuckets) {
 	return 0;
 }
 
-kv_t *kvStoreGet(kv_store_t *store, string_t key) {
+string_t *kvStoreGet(kv_store_t *store, string_t key) {
 	if (0 == store->size)
 		return NULL;
 	assert(NULL != store->buckets);
@@ -288,7 +289,7 @@ kv_t *kvStoreGet(kv_store_t *store, string_t key) {
 	offset = stringHash(key) % store->nbuckets;
 	for (kv_t *node = store->buckets[offset]; node; node = node->next) {
 		if (stringCmp(node->key, key) == 0)
-			return node;
+			return &node->value;
 	}
 	return NULL;
 }
@@ -296,23 +297,25 @@ kv_t *kvStoreGet(kv_store_t *store, string_t key) {
 int kvStoreSet(kv_store_t *store, string_t key, string_t value, string_t *old_value) {
 	kv_t *new_node, *node, *prev;
 	size_t offset;
-	
-	new_node = malloc(sizeof(*new_node));
-	if (!new_node)
-		return -1;
-	new_node->key = key;
-	new_node->value = value;
-	new_node->next = NULL;
-	old_value = NULL;
 
 	offset = stringHash(key) % store->nbuckets;
 	node = store->buckets[offset];
 
 	if (NULL == node) {
-		store->buckets[offset] = node;
+		new_node = malloc(sizeof(*new_node));
+		if (!new_node)
+			return -1;
+
+		new_node->key = key;
+		new_node->value = value;
+		new_node->next = NULL;
+		old_value = NULL;
+
+		store->buckets[offset] = new_node;
+		store->size++;
 		return 0;
 	}
-
+	
 	prev = NULL;
 	while (node) {
 		if (stringCmp(node->key, key) == 0) {
@@ -321,6 +324,7 @@ int kvStoreSet(kv_store_t *store, string_t key, string_t value, string_t *old_va
 			old_value->data = node->value.data;
 
 			node->value = value;
+			store->size++;
 			return 0;
 		}
 		prev = node;
@@ -328,7 +332,18 @@ int kvStoreSet(kv_store_t *store, string_t key, string_t value, string_t *old_va
 	}
 	assert(NULL != prev);
 	assert(NULL == prev->next);
-	prev->next = node;
+
+	new_node = malloc(sizeof(*new_node));
+	if (!new_node)
+		return -1;
+
+	new_node->key = key;
+	new_node->value = value;
+	new_node->next = NULL;
+	old_value = NULL;
+
+	prev->next = new_node;
+	store->size++;
 	return 0;
 }
 

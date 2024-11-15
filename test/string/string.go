@@ -30,7 +30,6 @@ func testStringPut(t *testing.T) {
 				t.Fatal("failed to allocate string")
 			}
 
-			input := "golang"
 			bytes := []byte(input)
 			for _, b := range bytes {
 				C.stringPut(str, C.char(b))
@@ -46,7 +45,44 @@ func testStringPut(t *testing.T) {
 			}
 		})
 	}
+}
 
+func testStringPutN(t *testing.T) {
+	inputs := []string{
+		"Everything",
+		" you see here ",
+		"will",
+		" be",
+		"              ",
+		"appended",
+	}
+
+	var sb strings.Builder
+	str := &C.string_t{}
+	C.stringInit(str)
+	if C.stringGrow(str, 256) != 0 {
+		t.Fatal("failed to allocate for C.string_t")
+	}
+
+	for _, input := range inputs {
+		sb.WriteString(input)
+
+		current := sb.String()
+		buffer := C.CString(input)
+		length := C.size_t(len(input))
+		defer C.free(unsafe.Pointer(buffer))
+
+		C.stringPutN(str, buffer, length)
+
+		if int(str.len) != len(current) {
+			t.Fatalf("string should contain %d chars, got %d\nfailed at '%s'",
+				length, str.len, current)
+		}
+		if s := C.GoStringN(str.data, C.int(str.len)); s != current {
+			t.Fatalf("string should contain '%s', got '%s'",
+				current, s)
+		}
+	}
 }
 
 func testStringHash(t *testing.T) {
