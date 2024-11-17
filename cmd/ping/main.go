@@ -38,10 +38,17 @@ func main() {
 			msg := []byte("*1\r\n$4\r\nPING\r\n")
 			_, err = conn.Write(msg)
 			if err != nil {
-				log.Println("ERROR send", i, err)
+				log.Println("ERROR Write", i, err)
 				return
 			}
-			log.Println("OK", i)
+
+			buf := make([]byte, 1024)
+			_, err = conn.Read(buf)
+			if err != nil {
+				log.Println("ERROR Read", i, err)
+				return
+			}
+			log.Println("OK", i, string(buf))
 		}()
 	}
 

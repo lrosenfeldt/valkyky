@@ -45,6 +45,7 @@ typedef enum ProtocolRet {
 	PROTOCOL_ERR_LENGTH_UNPARSEABLE,
 	PROTOCOL_ERR_DATA_UNTERMINATED,
 	PROTOCOL_OK = 0,
+	PROTOCOL_EXEC,
 } protocol_ret_t;
 
 typedef enum QueryState {
@@ -88,6 +89,8 @@ typedef struct Client {
 	command_id_t query_cmd;
 	size_t query_len;
 	string_t query_buf;
+	// output buffer
+	string_t out;
 } client_t;
 
 typedef struct TcpServer {
@@ -164,6 +167,25 @@ void stringPutN(string_t *str, const char *buffer, size_t len) {
 	return;
 }
 
+int stringAppend(string_t *str, const char *buffer, size_t len) {
+	assert(str->len <= SIZE_MAX - len);
+	if (str->cap < str->len + len) {
+		size_t new_cap;
+
+		new_cap = str->cap + len;
+		if (4 >= new_cap)
+			new_cap = 8;
+		else
+			new_cap = new_cap + new_cap/2;
+		if (stringGrow(str, new_cap) != 0)
+			return -1;
+	}
+
+	assert(NULL != str->data);
+	memcpy(str->data + str->len, buffer, len);
+	str->len += len;
+	return 0;
+}
 
 int stringCmp(string_t left, string_t right) {
 	if (left.len != right.len) {
@@ -537,6 +559,7 @@ void clientInit(client_t *client) {
 	client->query_cmd = COMMAND_UNKNOWN;
 	client->query_len = 0;
 	stringInit(&client->query_buf);
+	stringInit(&client->out);
 	return;
 }
 
@@ -643,12 +666,28 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 			client->query_cmd = cmd;
 
 			client->query_state = QUERY_PARSING_TYPE;
-			return PROTOCOL_OK;
+			return PROTOCOL_EXEC;
 		}
 		// TODO: handle query args
 		assert(0);
 		return PROTOCOL_OK;
 	}
+}
+
+int clientExecQuery(client_t *client) {
+	switch (client->query_cmd) {
+	case COMMAND_PING:
+		if (stringAppend(&client->out, "+PONG\r\n", 9) != 0)
+			return PROTOCOL_ERR_OOM;
+		break;
+	case COMMAND_UNKNOWN:
+	case COMMANDS_LENGTH:
+		// command not allowed
+		assert(0);
+		break;
+	}
+	// TODO: reset client
+	return PROTOCOL_OK;
 }
 
 int clientParseAndExec(client_t *client, const char *buffer, int len) {
@@ -658,7 +697,9 @@ int clientParseAndExec(client_t *client, const char *buffer, int len) {
 	for (int i = 0; i < len; ++i) {
 		ret = clientParseCh(client, buffer, &i, len);
 		if (PROTOCOL_OK > ret)
-			return ret;
+			return -1;
+		else if (PROTOCOL_EXEC == ret && clientExecQuery(client) != 0)
+			return -1;
 	}
 	return 0;
 }
@@ -777,12 +818,43 @@ int tcpServerHandle(tcp_server_t *server, event_t event) {
 		}
 
 		if (event.flags & EVENT_FLAG_DROP) {
-				shutdown(client->fd, SHUT_RDWR);
-				fprintf(stderr, "client disconnected during poll\n");
-				closing = 1;
+			shutdown(client->fd, SHUT_RDWR);
+			fprintf(stderr, "client disconnected during poll\n");
+			closing = 1;
 		}
 
-		// TODO: WRITABLE event
+		if (
+			(event.flags & EVENT_FLAG_WRITABLE)
+			&& client->out.len > 0
+			&& !closing
+		) {
+			int nwritten;
+
+			nwritten = write(client->fd,
+					client->out.data, client->out.len);
+
+			if (0 > nwritten) {
+				// TODO: EAGAIN and EWOULDBLOCK?
+				if (EAGAIN != errno
+					&& EWOULDBLOCK != errno
+					&& EINTR != errno) {
+					shutdown(client->fd, SHUT_RDWR);
+					fprintf(stderr,
+						"failed to write: %s\n",
+						strerror(errno));
+					closing = 1;
+				}
+			} else if (0 == nwritten) {
+				// TODO: this should be impossible
+				assert(0);
+			} else {
+				assert(NULL != client->out.data);
+				memmove(client->out.data,
+					client->out.data + nwritten, nwritten);
+				client->out.len -= nwritten;
+			}
+		}
+
 		if (closing) {
 			close(client->fd);
 			memmove(client, server->clients + tcpServerClientCount(server), sizeof(*client));
@@ -811,7 +883,7 @@ int main(void) {
 	eventStreamWatch(&server.stream, server.fd, EVENT_FLAG_READABLE);
 
 	for (;;) {
-		if (eventStreamPoll(&server.stream, 500) != 0) {
+		if (eventStreamPoll(&server.stream, 10) != 0) {
 			fprintf(stderr, "failed to poll\n");
 			goto close;
 		}
