@@ -2,6 +2,7 @@ package kv
 
 // #cgo CFLAGS: -I${SRCDIR}/../../
 // #include "valkyky.c"
+// #include "string_test_da.c"
 import "C"
 import (
 	"fmt"

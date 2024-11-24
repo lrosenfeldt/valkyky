@@ -15,6 +15,7 @@
 #ifndef SIZE_MAX
 	#define SIZE_MAX (~((size_t)0))
 #endif // SIZE_MAX
+#define UNUSED(X) ((void)(X))
 
 #define MAX_CONNECTIONS 1
 
@@ -39,11 +40,14 @@ typedef enum ProtocolRet {
 	PROTOCOL_ERR_BULK_LENGTH_ZERO,
 	PROTOCOL_ERR_COMMAND_PREFIX_MISSING,
 	PROTOCOL_ERR_COMMAND_UNKNOWN,
+	PROTOCOL_ERR_COMMAND_ARITY_TOO_SMALL,
+	PROTOCOL_ERR_COMMAND_ARITY_TOO_BIG,
 	PROTOCOL_ERR_LENGTH_EMPTY,
 	PROTOCOL_ERR_LENGTH_UNTERMINATED,
 	PROTOCOL_ERR_LENGTH_OVERFLOW,
 	PROTOCOL_ERR_LENGTH_UNPARSEABLE,
 	PROTOCOL_ERR_DATA_UNTERMINATED,
+	PROTOCOL_ERR_TYPE_UNEXPECTED,
 	PROTOCOL_OK = 0,
 	PROTOCOL_EXEC,
 } protocol_ret_t;
@@ -60,6 +64,16 @@ typedef struct String {
 	size_t cap, len;
 	char *data;
 } string_t;
+
+typedef struct DaString {
+	size_t cap, len;
+	string_t *data;
+} da_string_t;
+
+typedef struct Arity {
+	unsigned int min;
+	unsigned int max;
+} arity_t;
 
 typedef struct Kv {
 	struct Kv *next;
@@ -87,7 +101,7 @@ typedef struct Client {
 	// query specific data
 	query_state_t query_state;
 	command_id_t query_cmd;
-	size_t query_len;
+	da_string_t query_args;
 	string_t query_buf;
 	// output buffer
 	string_t out;
@@ -99,71 +113,77 @@ typedef struct TcpServer {
 	event_stream_t stream;
 } tcp_server_t;
 
-const string_t commands[COMMANDS_LENGTH] = {
+const string_t commandNames[COMMANDS_LENGTH] = {
 	[COMMAND_UNKNOWN] = {0,0,NULL},
 	[COMMAND_PING] = {5,4,"PING"},
 };
 
+const arity_t commandArities[COMMANDS_LENGTH] = {
+	[COMMAND_UNKNOWN] = {0,0},
+	[COMMAND_PING] = {0,1},
+};
+
 #define min(X, Y) ((X) <= (Y) ? (X) : (Y))
 
-void stringInit(string_t *str) {
-	str->cap = str->len = 0;
-	str->data = NULL;
-	return;
-}
+#define daInit(DA) ((DA)->cap = (DA)->len = 0, (void)((DA)->data = NULL))
 
-void stringDrop(string_t *str) {
-	if (0 < str->cap) {
-		assert(NULL != str->data);
-		free(str->data);
+#define daDrop(DA) (_daDrop(&((DA)->cap), &((DA)->len), (void **)&((DA)->data)))
+void _daDrop(size_t *cap, size_t *len, void **data) {
+	if (0 < *cap) {
+		assert(NULL != *data);
+		free(*data);
 	}
-	str->cap = str->len = 0;
-	str->data = NULL;
+	*cap = *len = 0;
+	*data = NULL;
 	return;
 }
 
-void stringClear(string_t *str) {
-	if (0 < str->len) {
-		assert(NULL != str->data);
-		memset(str->data, 0, str->len);
+#define daClear(DA) (_daClear(&((DA)->cap), &((DA)->len),\
+			(void **)&((DA)->data), sizeof((DA)->data[0])))
+void _daClear(const size_t *cap, size_t *len, void **data, size_t el_size) {
+	UNUSED(cap);
+	if (0 < *len) {
+		assert(NULL != *data);
+		memset(*data, 0, el_size * (*len));
 	}
-	str->len = 0;
+	*len = 0;
 	return;
 }
 
-int stringGrow(string_t *str, size_t cap) {
-	char *new_data;
-	assert(str->cap < cap);
-	new_data = malloc(cap);
+#define daGrow(DA, CAP) (_daGrow(&((DA)->cap), &((DA)->len),\
+			(void **)&((DA)->data), sizeof((DA)->data[0]), (CAP)))
+int _daGrow(size_t *cap, const size_t *len, void **data, size_t el_size, size_t new_cap) {
+	void *new_data;
+	assert(*cap < new_cap);
+	new_data = malloc(el_size * new_cap);
 	if (!new_data)
 		return -1;
-	memset(new_data, 0, cap);
-	if (0 < str->len) {
-		assert(NULL != str->data);
-		memcpy(new_data, str->data, str->len);
+	memset(new_data, 0, el_size * new_cap);
+
+	if (0 < *len) {
+		assert(NULL != *data);
+		memcpy(new_data, *data, el_size * (*len));
 	}
-	if (0 < str->cap) {
-		assert(NULL != str->data);
-		free(str->data);
+	if (0 < *cap) {
+		assert(NULL != *data);
+		free(*data);
 	}
-	str->data = new_data;
-	str->cap = cap;
+	*data = new_data;
+	*cap = new_cap;
 	return 0;
 }
 
-void stringPut(string_t *str, char ch) {
-	assert(str->len < str->cap);
-	str->data[str->len] = ch;
-	str->len++;
-	return;
-}
+#define daPut(DA, EL) (assert((DA)->len < (DA)->cap),\
+		(DA)->data[(DA)->len] = (EL), (void)(DA)->len++)
 
-void stringPutN(string_t *str, const char *buffer, size_t len) {
-	assert(str->len <= SIZE_MAX - len);
-	assert(str->len + len <= str->cap);
-	assert(NULL != str->data);
-	memcpy(str->data + str->len, buffer, len);
-	str->len += len;
+#define daPutN(DA, ELS, N) (_daPutN(&((DA)->cap), &((DA)->len),\
+			(void **)&((DA)->data), sizeof((DA)->data[0]),\
+			(ELS), (N)))
+void _daPutN(const size_t *cap, size_t *len, void **data, size_t el_size, const void *buffer, size_t n) {
+	assert(*len <= SIZE_MAX - n);
+	assert(*len + n <= *cap);
+	memcpy(((char *)*data) + el_size * (*len), buffer, el_size * n);
+	*len += n;
 	return;
 }
 
@@ -177,7 +197,7 @@ int stringAppend(string_t *str, const char *buffer, size_t len) {
 			new_cap = 8;
 		else
 			new_cap = new_cap + new_cap/2;
-		if (stringGrow(str, new_cap) != 0)
+		if (daGrow(str, new_cap) != 0)
 			return -1;
 	}
 
@@ -547,27 +567,35 @@ int commAcceptTcp(char *err, int fd) {
 
 command_id_t commandId(string_t str) {
 	for (size_t id = 1; id < COMMANDS_LENGTH; ++id) {
-		if (stringCmp(str, commands[id]) == 0)
+		if (stringCmp(str, commandNames[id]) == 0)
 			return id;
 	}
 	return COMMAND_UNKNOWN;
+}
+
+int commandArityRangeCmp(command_id_t cmd, size_t target) {
+	if (target < commandArities[cmd].min)
+		return -1;
+	if (target > commandArities[cmd].max)
+		return -1;
+	return 0;
 }
 
 void clientInit(client_t *client) {
 	client->fd = -1;
 	client->query_state = QUERY_PARSING_TYPE;
 	client->query_cmd = COMMAND_UNKNOWN;
-	client->query_len = 0;
-	stringInit(&client->query_buf);
-	stringInit(&client->out);
+	daInit(&client->query_args);
+	daInit(&client->query_buf);
+	daInit(&client->out);
 	return;
 }
 
 void clientReset(client_t *client) {
 	client->query_state = QUERY_PARSING_TYPE;
 	client->query_cmd = COMMAND_UNKNOWN;
-	client->query_len = 0;
-	stringDrop(&client->query_buf);
+	daDrop(&client->query_args);
+	daDrop(&client->query_buf);
 	return;
 }
 
@@ -579,12 +607,16 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 	ch = buffer[*offset];
 	switch (client->query_state) {
 	case QUERY_PARSING_TYPE:
-		if (0 == client->query_len) {
+		if (0 == client->query_args.cap) {
 			if ('*' != ch)
 				return PROTOCOL_ERR_BULK_PREFIX_MISSING;
 		} else if (COMMAND_UNKNOWN == client->query_cmd) {
 			if ('$' != ch)
 				return PROTOCOL_ERR_BULK_PREFIX_MISSING;
+		} else {
+			// TODO: currently only bulk strings are supported
+			if ('$' != ch)
+				return PROTOCOL_ERR_TYPE_UNEXPECTED;
 		}
 		client->query_state = QUERY_PARSING_LENGTH;
 		return PROTOCOL_OK;
@@ -599,13 +631,13 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 		}
 
 		if (0 == client->query_buf.cap) {
-			if (stringGrow(&client->query_buf, 9) != 0)
+			if (daGrow(&client->query_buf, 9) != 0)
 				return PROTOCOL_ERR_OOM;
 		}
 		assert(9 <= client->query_buf.cap);
 		if (9 <= client->query_buf.len)
 			return PROTOCOL_ERR_LENGTH_OVERFLOW;
-		stringPut(&client->query_buf, ch);
+		daPut(&client->query_buf, ch);
 		return PROTOCOL_OK;
 	case QUERY_PARSING_LENGTH_END:
 		if ('\n' != ch)
@@ -615,27 +647,34 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 		if (stringToSize(client->query_buf, &parsed) != 0)
 			return PROTOCOL_ERR_LENGTH_UNPARSEABLE;
 
-		if (0 == client->query_len) {
-			// TODO: validate query_len
+		if (0 == client->query_args.cap) {
+			// TODO: upper limit on arity
 			assert(255 >= parsed);
-			client->query_len = parsed;
-			stringClear(&client->query_buf);
+			if (daGrow(&client->query_args, parsed) != 0)
+				return PROTOCOL_ERR_OOM;
+			daClear(&client->query_buf);
 
 			client->query_state = QUERY_PARSING_TYPE;
 			return PROTOCOL_OK;
 		} else if (COMMAND_UNKNOWN == client->query_cmd) {
 			// TODO: validate command length
 			assert(255 >= parsed);
-			stringDrop(&client->query_buf);
+			daDrop(&client->query_buf);
 
-			if (stringGrow(&client->query_buf, parsed) != 0)
+			if (daGrow(&client->query_buf, parsed) != 0)
 				return PROTOCOL_ERR_OOM;
 
 			client->query_state = QUERY_PARSING_DATA;
 			return PROTOCOL_OK;
 		}
-		// TODO: handle query args
-		assert(0);
+		// TODO: limit on query arg?
+		assert(255 >= parsed);
+		daDrop(&client->query_buf);
+
+		if (daGrow(&client->query_buf, parsed) != 0)
+			return PROTOCOL_ERR_OOM;
+
+		client->query_state = QUERY_PARSING_DATA;
 		return PROTOCOL_OK;
 	case QUERY_PARSING_DATA:
 		if (client->query_buf.len == client->query_buf.cap) {
@@ -649,7 +688,7 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 
 		consumed = min(client->query_buf.cap - client->query_buf.len,
 				(size_t)(len - *offset));
-		stringPutN(&client->query_buf, buffer + *offset, consumed);
+		daPutN(&client->query_buf, buffer + *offset, consumed);
 		*offset = *offset + consumed - 1;
 		return PROTOCOL_OK;
 	case QUERY_PARSING_DATA_END:
@@ -658,27 +697,74 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 
 		if (COMMAND_UNKNOWN == client->query_cmd) {
 			command_id_t cmd;
+			int arity_ok;
 
 			cmd = commandId(client->query_buf);
 			if (COMMAND_UNKNOWN == cmd)
 				return PROTOCOL_ERR_COMMAND_UNKNOWN;
-			stringDrop(&client->query_buf);
+			daDrop(&client->query_buf);
 			client->query_cmd = cmd;
 
+			arity_ok = commandArityRangeCmp(
+					client->query_cmd,
+					client->query_args.cap - 1);
+
+			if (0 > arity_ok)
+				return PROTOCOL_ERR_COMMAND_ARITY_TOO_SMALL;
+			else if (0 < arity_ok)
+				return PROTOCOL_ERR_COMMAND_ARITY_TOO_BIG;
+
 			client->query_state = QUERY_PARSING_TYPE;
-			return PROTOCOL_EXEC;
+			if (0 == client->query_args.cap - 1)
+				return PROTOCOL_EXEC;
+			return PROTOCOL_OK;
 		}
-		// TODO: handle query args
-		assert(0);
-		return PROTOCOL_OK;
+
+		daPut(&client->query_args, client->query_buf);
+		// just forget the content of the string
+		// if I'd change the data pointer, I would change the element
+		// in the array
+		daInit(&client->query_buf);
+		client->query_state = QUERY_PARSING_TYPE;
+		// query_args.cap is the full length including the command
+		if (client->query_args.len < client->query_args.cap - 1)
+			return PROTOCOL_OK;
+		return PROTOCOL_EXEC;
 	}
 }
 
 int clientExecQuery(client_t *client) {
 	switch (client->query_cmd) {
 	case COMMAND_PING:
-		if (stringAppend(&client->out, "+PONG\r\n", 9) != 0)
-			return PROTOCOL_ERR_OOM;
+		if (0 >= client->query_args.len) {
+			if (stringAppend(&client->out, "+PONG\r\n", 9) != 0)
+				return PROTOCOL_ERR_OOM;
+		} else {
+			char buffer_bulk_length[9];
+			string_t arg;
+			int digits;
+			assert(1 == client->query_args.len);
+			arg = client->query_args.data[0];
+
+
+			if (stringAppend(&client->out, "*1\r\n$", 7) != 0)
+				return PROTOCOL_ERR_OOM;
+
+			assert(1000000 > arg.len);
+			digits = snprintf(buffer_bulk_length, sizeof(buffer_bulk_length),
+				"%zu", arg.len);
+
+			assert(0 <= digits);
+			if (stringAppend(&client->out, buffer_bulk_length, (size_t)digits) != 0)
+				return PROTOCOL_ERR_OOM;
+
+			if (stringAppend(&client->out, "\r\n", 2) != 0)
+				return PROTOCOL_ERR_OOM;
+			if (stringAppend(&client->out, arg.data, arg.len) != 0)
+				return PROTOCOL_ERR_OOM;
+			if (stringAppend(&client->out, "\r\n", 2) != 0)
+				return PROTOCOL_ERR_OOM;
+		}
 		break;
 	case COMMAND_UNKNOWN:
 	case COMMANDS_LENGTH:
@@ -686,7 +772,6 @@ int clientExecQuery(client_t *client) {
 		assert(0);
 		break;
 	}
-	// TODO: reset client
 	return PROTOCOL_OK;
 }
 
@@ -696,10 +781,14 @@ int clientParseAndExec(client_t *client, const char *buffer, int len) {
 
 	for (int i = 0; i < len; ++i) {
 		ret = clientParseCh(client, buffer, &i, len);
-		if (PROTOCOL_OK > ret)
-			return -1;
-		else if (PROTOCOL_EXEC == ret && clientExecQuery(client) != 0)
-			return -1;
+		if (PROTOCOL_OK > ret) {
+			return ret;
+		} else if (PROTOCOL_EXEC == ret) {
+			if (clientExecQuery(client) != 0)
+				return -129;
+			clientReset(client);
+			continue;
+		}
 	}
 	return 0;
 }
@@ -810,9 +899,11 @@ int tcpServerHandle(tcp_server_t *server, event_t event) {
 
 				status = clientParseAndExec(client,
 						buffer, nread);
+				// TODO: send error to client
 				if (0 > status) {
+					shutdown(client->fd, SHUT_RDWR);
 					fprintf(stderr, "parsing error: %d\n", status);
-					clientReset(client);
+					closing = 1;
 				}
 			}
 		}
@@ -857,7 +948,8 @@ int tcpServerHandle(tcp_server_t *server, event_t event) {
 
 		if (closing) {
 			close(client->fd);
-			memmove(client, server->clients + tcpServerClientCount(server), sizeof(*client));
+			clientReset(client);
+			daDrop(&client->out);
 			client->fd = -1;
 			eventStreamUnwatchCurrent(&server->stream);
 		}
