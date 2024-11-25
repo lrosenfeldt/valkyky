@@ -577,7 +577,7 @@ int commandArityRangeCmp(command_id_t cmd, size_t target) {
 	if (target < commandArities[cmd].min)
 		return -1;
 	if (target > commandArities[cmd].max)
-		return -1;
+		return 1;
 	return 0;
 }
 
