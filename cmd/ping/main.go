@@ -36,7 +36,8 @@ func main() {
 			}
 			defer conn.Close()
 
-			msg := []byte("*2\r\n$4\r\nPING\r\n$7\r\nhellope\r\n")
+			// msg := []byte("*2\r\n$4\r\nPING\r\n$7\r\nhellope\r\n")
+			msg := []byte("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
 			// msg := []byte("*1\r\n$4\r\nPING\r\n")
 			_, err = conn.Write(msg)
 			if err != nil {

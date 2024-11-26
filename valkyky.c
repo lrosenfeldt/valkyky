@@ -31,6 +31,7 @@ typedef enum EventFlag {
 typedef enum CommandId {
 	COMMAND_UNKNOWN = 0,
 	COMMAND_PING,
+	COMMAND_SET,
 	COMMANDS_LENGTH,
 } command_id_t;
 
@@ -109,18 +110,25 @@ typedef struct Client {
 
 typedef struct TcpServer {
 	int fd;
+	kv_store_t *store;
 	client_t clients[MAX_CONNECTIONS];
 	event_stream_t stream;
 } tcp_server_t;
 
+typedef struct ValkykyOpts {
+	char *port;
+} valkyky_opts_t;
+
 const string_t commandNames[COMMANDS_LENGTH] = {
 	[COMMAND_UNKNOWN] = {0,0,NULL},
 	[COMMAND_PING] = {5,4,"PING"},
+	[COMMAND_SET] = {4,3,"SET"},
 };
 
 const arity_t commandArities[COMMANDS_LENGTH] = {
 	[COMMAND_UNKNOWN] = {0,0},
 	[COMMAND_PING] = {0,1},
+	[COMMAND_SET] = {2,2},
 };
 
 #define min(X, Y) ((X) <= (Y) ? (X) : (Y))
@@ -339,6 +347,7 @@ string_t *kvStoreGet(kv_store_t *store, string_t key) {
 int kvStoreSet(kv_store_t *store, string_t key, string_t value, string_t *old_value) {
 	kv_t *new_node, *node, *prev;
 	size_t offset;
+	assert(0 < store->nbuckets);
 
 	offset = stringHash(key) % store->nbuckets;
 	node = store->buckets[offset];
@@ -733,7 +742,43 @@ protocol_ret_t clientParseCh(client_t *client, const char *buffer, int *offset, 
 	}
 }
 
-int clientExecQuery(client_t *client) {
+void tcpServerInit(tcp_server_t *server) {
+	server->fd = -1;
+	server->store = NULL;
+	for (size_t i = 0; i < MAX_CONNECTIONS; ++i)
+		clientInit(server->clients + i);
+	eventStreamInit(&server->stream);
+	return;
+}
+
+void tcpServerClose(tcp_server_t *server) {
+	for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
+		if (0 <= server->clients[i].fd && server->fd != server->clients[i].fd)
+			close(server->clients[i].fd);
+		
+	}
+	close(server->fd);
+	return;
+}
+
+// TODO: avoid linear search
+client_t *tcpServerGetClient(tcp_server_t *server, int fd) {
+	for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
+		if (-1 == server->clients[i].fd || server->clients[i].fd == fd)
+			return server->clients + i;
+	}
+	return NULL;
+}
+
+size_t tcpServerClientCount(tcp_server_t *server) {
+	if (1 >= server->stream.nfds)
+		return 0;
+	return server->stream.nfds - 1;
+}
+
+int tcpServerExecQuery(tcp_server_t *server, client_t *client) {
+	int ok;
+
 	switch (client->query_cmd) {
 	case COMMAND_PING:
 		if (0 >= client->query_args.len) {
@@ -766,6 +811,38 @@ int clientExecQuery(client_t *client) {
 				return PROTOCOL_ERR_OOM;
 		}
 		break;
+	case COMMAND_SET:
+		assert(2 == client->query_args.len);
+
+		fprintf(stderr, "SET {cap:%zu len:%zu data:%.*s} {cap:%zu len:%zu data:%.*s}\n",
+			client->query_args.data[0].cap,
+			client->query_args.data[0].len,
+			(int)client->query_args.data[0].len,
+			client->query_args.data[0].data,
+			client->query_args.data[1].cap,
+			client->query_args.data[1].len,
+			(int)client->query_args.data[1].len,
+			client->query_args.data[1].data);
+		if (0 == server->store->nbuckets) {
+			if (kvStoreGrow(server->store, 32) != 0)
+				return PROTOCOL_ERR_OOM;
+		}
+		ok = kvStoreSet(server->store,
+				client->query_args.data[0],
+				client->query_args.data[1], NULL);
+		if (0 != ok)
+			return PROTOCOL_ERR_OOM;
+
+		string_t *val = kvStoreGet(server->store, client->query_args.data[0]);
+		fprintf(stderr, "GET {cap:%zu len:%zu data:%.*s}\n",
+			val->cap,
+			val->len,
+			(int)val->len,
+			val->data);
+
+		if (stringAppend(&client->out, "+OK\r\n", 5) != 0)
+			return PROTOCOL_ERR_OOM;
+		break;
 	case COMMAND_UNKNOWN:
 	case COMMANDS_LENGTH:
 		// command not allowed
@@ -775,7 +852,7 @@ int clientExecQuery(client_t *client) {
 	return PROTOCOL_OK;
 }
 
-int clientParseAndExec(client_t *client, const char *buffer, int len) {
+int tcpServerParseAndExec(tcp_server_t *server, client_t *client, const char *buffer, int len) {
 	protocol_ret_t ret;
 	assert(0 < len);
 
@@ -784,46 +861,14 @@ int clientParseAndExec(client_t *client, const char *buffer, int len) {
 		if (PROTOCOL_OK > ret) {
 			return ret;
 		} else if (PROTOCOL_EXEC == ret) {
-			if (clientExecQuery(client) != 0)
-				return -129;
+			ret = tcpServerExecQuery(server, client);
+			if (0 != ret)
+				return ret;
 			clientReset(client);
 			continue;
 		}
 	}
 	return 0;
-}
-
-void tcpServerInit(tcp_server_t *server) {
-	server->fd = -1;
-	for (size_t i = 0; i < MAX_CONNECTIONS; ++i)
-		clientInit(server->clients + i);
-	eventStreamInit(&server->stream);
-	return;
-}
-
-void tcpServerClose(tcp_server_t *server) {
-	for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
-		if (0 <= server->clients[i].fd && server->fd != server->clients[i].fd)
-			close(server->clients[i].fd);
-		
-	}
-	close(server->fd);
-	return;
-}
-
-// TODO: avoid linear search
-client_t *tcpServerGetClient(tcp_server_t *server, int fd) {
-	for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
-		if (-1 == server->clients[i].fd || server->clients[i].fd == fd)
-			return server->clients + i;
-	}
-	return NULL;
-}
-
-size_t tcpServerClientCount(tcp_server_t *server) {
-	if (1 >= server->stream.nfds)
-		return 0;
-	return server->stream.nfds - 1;
 }
 
 int tcpServerHandle(tcp_server_t *server, event_t event) {
@@ -897,7 +942,8 @@ int tcpServerHandle(tcp_server_t *server, event_t event) {
 			} else {
 				int status;
 
-				status = clientParseAndExec(client,
+				status = tcpServerParseAndExec(server,
+						client,
 						buffer, nread);
 				// TODO: send error to client
 				if (0 > status) {
@@ -958,7 +1004,12 @@ int tcpServerHandle(tcp_server_t *server, event_t event) {
 }
 
 #if defined(VALKYKY_EXE)
-int main(void) {
+kv_store_t valkyky;
+
+int main(int argc, char **argv) {
+	UNUSED(argc);
+	UNUSED(argv);
+
 	const char *port = ":12345";
 	char err[COMM_ERROR_LENGTH] = {0};
 	int fd;
@@ -972,6 +1023,8 @@ int main(void) {
 	}
 	tcpServerInit(&server);
 	server.fd = fd;
+	server.store = &valkyky;
+	kvStoreInit(&valkyky);
 	eventStreamWatch(&server.stream, server.fd, EVENT_FLAG_READABLE);
 
 	for (;;) {
